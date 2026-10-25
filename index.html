@@ -1,0 +1,2458 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Application Command Center</title>
+  <!-- Tailwind CSS -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <!-- React, ReactDOM & Babel for in-browser JSX execution -->
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <!-- Firebase v10 Compat SDKs (works directly in standalone HTML without a bundler) -->
+  <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
+  <style>
+    body {
+      background-color: #020617;
+      color: #f8fafc;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    }
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-track { background: #0f172a; }
+    ::-webkit-scrollbar-thumb { background: #334155; border-radius: 3px; }
+    ::-webkit-scrollbar-thumb:hover { background: #475569; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState, useEffect, useMemo, useRef } = React;
+
+    // ==========================================
+    // CONSTANTS & STRICT V1 SPECIFICATION RULES
+    // ==========================================
+    const ALLOWED_STATUSES = [
+      'Saved',
+      'Applied',
+      'Assessment',
+      'Interview',
+      'Offer',
+      'Rejected',
+      'Withdrawn'
+    ];
+
+    const TRACKING_PARAMS = new Set([
+      'utm_source', 'utm_medium', 'utm_campaign', 'utm_term', 'utm_content', 'utm_id',
+      'fbclid', 'gclid', 'msclkid', 'mc_cid', 'mc_eid', '_ga', '_gl',
+      'ref', 'referrer', 'source', 'src', 'trk', 'trkinfo', 'trackingid', 'lipi', 'lici'
+    ]);
+
+    const COMPANY_SUFFIXES = /\b(inc|llc|ltd|corp|corporation|company|co|technologies|technology|systems|solutions|group)\b/gi;
+
+    const ROLE_SYNONYMS = {
+      'admin': 'administrator',
+      'sysadmin': 'systems administrator',
+      'sys': 'systems',
+      'sr': 'senior',
+      'jr': 'junior',
+      'eng': 'engineer',
+      'engr': 'engineer',
+      'ops': 'operations',
+      'devops': 'development operations',
+      'sec': 'security',
+      'infra': 'infrastructure'
+    };
+
+    const STORAGE_KEYS = {
+      FIREBASE_CONFIG: 'acc_firebase_config_v1',
+      DEMO_MODE: 'acc_explicit_demo_mode_v1',
+      DEMO_APPS: 'acc_demo_applications_v1',
+      DEMO_PREFS: 'acc_demo_preferences_v1'
+    };
+
+    // ==========================================
+    // UTILITY FUNCTIONS (DATES, URL, DUPLICATES, CSV)
+    // ==========================================
+
+    // Local YYYY-MM-DD (Never raw UTC slice)
+    function getLocalTodayStr() {
+      const d = new Date();
+      const year = d.getFullYear();
+      const month = String(d.getMonth() + 1).padStart(2, '0');
+      const day = String(d.getDate()).padStart(2, '0');
+      return `${year}-${month}-${day}`;
+    }
+
+    function diffDaysLocal(targetDateStr, todayStr) {
+      if (!targetDateStr) return null;
+      const [ty, tm, td] = targetDateStr.split('-').map(Number);
+      const [cy, cm, cd] = todayStr.split('-').map(Number);
+      if (!ty || !tm || !td) return null;
+      const targetUTC = Date.UTC(ty, tm - 1, td);
+      const todayUTC = Date.UTC(cy, cm - 1, cd);
+      return Math.round((targetUTC - todayUTC) / (1000 * 60 * 60 * 24));
+    }
+
+    function generateId(prefix = 'app') {
+      if (typeof crypto !== 'undefined' && crypto.randomUUID) {
+        return `${prefix}_${crypto.randomUUID()}`;
+      }
+      return `${prefix}_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
+    }
+
+    function formatLocalTimestamp(isoString) {
+      if (!isoString) return '';
+      const d = new Date(isoString);
+      if (isNaN(d.getTime())) return isoString;
+      return d.toLocaleString(undefined, {
+        year: 'numeric', month: 'short', day: 'numeric',
+        hour: '2-digit', minute: '2-digit'
+      });
+    }
+
+    // URL Normalization: Lowercase hostname ONLY, preserve path/query case, remove known tracking params
+    function normalizeJobUrl(rawUrl) {
+      if (!rawUrl || !rawUrl.trim()) return '';
+      let trimmed = rawUrl.trim();
+      try {
+        const hasProtocol = /^[a-zA-Z][a-zA-Z\d+\-.]*:\/\//.test(trimmed);
+        const urlObj = new URL(hasProtocol ? trimmed : `https://${trimmed}`);
+        const hostname = urlObj.hostname.toLowerCase();
+        let pathname = urlObj.pathname;
+        if (pathname.length > 1) {
+          pathname = pathname.replace(/\/+$/, '');
+        }
+        const keptParams = [];
+        urlObj.searchParams.forEach((val, key) => {
+          if (!TRACKING_PARAMS.has(key.toLowerCase())) {
+            keptParams.push([key, val]);
+          }
+        });
+        keptParams.sort((a, b) => a[0].localeCompare(b[0]));
+        const searchStr = keptParams.length > 0
+          ? '?' + keptParams.map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`).join('&')
+          : '';
+        return `${hostname}${pathname}${searchStr}`;
+      } catch (e) {
+        return trimmed.replace(/\s+/g, ' ');
+      }
+    }
+
+    function normalizeText(str) {
+      if (!str) return '';
+      return str
+        .toLowerCase()
+        .replace(/[.,/#!$%^&*;:{}=\-_~()]/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+    }
+
+    function normalizeCompanyCore(str) {
+      const base = normalizeText(str);
+      const stripped = base.replace(COMPANY_SUFFIXES, ' ').replace(/\s+/g, ' ').trim();
+      return stripped || base;
+    }
+
+    function tokenizeTitle(str) {
+      const base = normalizeText(str);
+      if (!base) return [];
+      const rawTokens = base.split(' ').filter(Boolean);
+      const expanded = [];
+      for (const t of rawTokens) {
+        if (ROLE_SYNONYMS[t]) {
+          expanded.push(...ROLE_SYNONYMS[t].split(' '));
+        } else {
+          expanded.push(t);
+        }
+      }
+      return Array.from(new Set(expanded));
+    }
+
+    function checkDuplicateMatch(candidate, existingRecord) {
+      const reasons = [];
+
+      // 1. Check URL match
+      const candUrl = normalizeJobUrl(candidate.postingUrl);
+      const existUrl = normalizeJobUrl(existingRecord.postingUrl);
+      if (candUrl && existUrl && candUrl === existUrl) {
+        reasons.push('Identical Posting URL (normalized)');
+      }
+
+      // 2. Check Exact Company + Job Title
+      const candCompNorm = normalizeText(candidate.company);
+      const existCompNorm = normalizeText(existingRecord.company);
+      const candTitleNorm = normalizeText(candidate.jobTitle);
+      const existTitleNorm = normalizeText(existingRecord.jobTitle);
+
+      if (candCompNorm && existCompNorm && candCompNorm === existCompNorm && candTitleNorm === existTitleNorm) {
+        reasons.push('Exact Company & Job Title match');
+      } else if (candCompNorm && existCompNorm) {
+        // 3. Check Fuzzy/Similar Company + Title
+        const cCore1 = normalizeCompanyCore(candidate.company);
+        const cCore2 = normalizeCompanyCore(existingRecord.company);
+        const companySimilar = cCore1 === cCore2 ||
+          (cCore1.length >= 4 && cCore2.length >= 4 && (cCore1.includes(cCore2) || cCore2.includes(cCore1)));
+
+        if (companySimilar) {
+          const tokens1 = tokenizeTitle(candidate.jobTitle);
+          const tokens2 = tokenizeTitle(existingRecord.jobTitle);
+          if (tokens1.length > 0 && tokens2.length > 0) {
+            const intersection = tokens1.filter(t => tokens2.includes(t));
+            const union = new Set([...tokens1, ...tokens2]);
+            const jaccard = intersection.length / union.size;
+            if (jaccard >= 0.6) {
+              reasons.push('Similar Company & Job Title');
+            }
+          }
+        }
+      }
+
+      return {
+        isDuplicate: reasons.length > 0,
+        reasons
+      };
+    }
+
+    // RFC 4180 CSV Escaping & Parsing
+    const CSV_HEADERS = [
+      'id', 'company', 'jobTitle', 'status', 'postingUrl', 'salaryRange',
+      'location', 'applicationDate', 'deadline', 'followUpDate', 'notes', 'activityHistory'
+    ];
+
+    function escapeCsvCell(value) {
+      const str = value === null || value === undefined ? '' : String(value);
+      if (/[",\r\n]/.test(str)) {
+        return `"${str.replace(/"/g, '""')}"`;
+      }
+      return str;
+    }
+
+    function serializeApplicationsToCsv(applications) {
+      const lines = [CSV_HEADERS.join(',')];
+      for (const app of applications) {
+        const historyJson = JSON.stringify(Array.isArray(app.activityHistory) ? app.activityHistory : []);
+        const row = [
+          escapeCsvCell(app.id),
+          escapeCsvCell(app.company),
+          escapeCsvCell(app.jobTitle),
+          escapeCsvCell(app.status),
+          escapeCsvCell(app.postingUrl || ''),
+          escapeCsvCell(app.salaryRange || ''),
+          escapeCsvCell(app.location || ''),
+          escapeCsvCell(app.applicationDate || ''),
+          escapeCsvCell(app.deadline || ''),
+          escapeCsvCell(app.followUpDate || ''),
+          escapeCsvCell(app.notes || ''),
+          escapeCsvCell(historyJson)
+        ];
+        lines.push(row.join(','));
+      }
+      return lines.join('\r\n');
+    }
+
+    // Full RFC 4180 State-Machine Parser (supports multi-line notes & escaped quotes in JSON)
+    function parseRfc4180Csv(text) {
+      const rows = [];
+      let currentRow = [];
+      let currentField = '';
+      let inQuotes = false;
+
+      for (let i = 0; i < text.length; i++) {
+        const ch = text[i];
+        const next = text[i + 1];
+
+        if (inQuotes) {
+          if (ch === '"' && next === '"') {
+            currentField += '"';
+            i++;
+          } else if (ch === '"') {
+            inQuotes = false;
+          } else {
+            currentField += ch;
+          }
+        } else {
+          if (ch === '"') {
+            inQuotes = true;
+          } else if (ch === ',') {
+            currentRow.push(currentField);
+            currentField = '';
+          } else if (ch === '\r' && next === '\n') {
+            currentRow.push(currentField);
+            rows.push(currentRow);
+            currentRow = [];
+            currentField = '';
+            i++;
+          } else if (ch === '\n' || ch === '\r') {
+            currentRow.push(currentField);
+            rows.push(currentRow);
+            currentRow = [];
+            currentField = '';
+          } else {
+            currentField += ch;
+          }
+        }
+      }
+      if (currentField.length > 0 || currentRow.length > 0) {
+        currentRow.push(currentField);
+        rows.push(currentRow);
+      }
+      return rows;
+    }
+
+    // Deduplicate and merge activityHistory arrays by event.id
+    function mergeActivityHistories(existingHistory = [], importedHistory = []) {
+      const map = new Map();
+      for (const evt of existingHistory) {
+        if (evt && evt.id) map.set(evt.id, evt);
+      }
+      for (const evt of importedHistory) {
+        if (evt && evt.id && !map.has(evt.id)) {
+          map.set(evt.id, evt);
+        }
+      }
+      return Array.from(map.values()).sort((a, b) =>
+        new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()
+      );
+    }
+
+    // ==========================================
+    // STATUS STYLING HELPERS
+    // ==========================================
+    function getStatusBadgeClasses(status) {
+      switch (status) {
+        case 'Saved': return 'bg-slate-800 text-slate-200 border-slate-700';
+        case 'Applied': return 'bg-sky-950/80 text-sky-300 border-sky-700/50';
+        case 'Assessment': return 'bg-purple-950/80 text-purple-300 border-purple-700/50';
+        case 'Interview': return 'bg-amber-950/80 text-amber-300 border-amber-700/50';
+        case 'Offer': return 'bg-emerald-950/80 text-emerald-300 border-emerald-700/50';
+        case 'Rejected': return 'bg-rose-950/80 text-rose-300 border-rose-700/50';
+        case 'Withdrawn': return 'bg-zinc-900 text-zinc-400 border-zinc-700';
+        default: return 'bg-slate-800 text-slate-300 border-slate-700';
+      }
+    }
+
+    // ==========================================
+    // MAIN APPLICATION COMPONENT
+    // ==========================================
+    function App() {
+      // Storage & Auth State: 'unconfigured' | 'firebase' | 'demo'
+      const [mode, setMode] = useState('unconfigured');
+      const [user, setUser] = useState(null);
+      const [authLoading, setAuthLoading] = useState(true);
+      const [cloudError, setCloudError] = useState(null);
+
+      // Data State
+      const [applications, setApplications] = useState([]);
+      const [warningWindowDays, setWarningWindowDays] = useState(3);
+
+      // UI & Filter State
+      const [searchQuery, setSearchQuery] = useState('');
+      const [statusFilter, setStatusFilter] = useState('All');
+      const [sortBy, setSortBy] = useState('updatedAt');
+      const [sortAsc, setSortAsc] = useState(false);
+
+      // Modals State
+      const [showSetupModal, setShowSetupModal] = useState(false);
+      const [editingApp, setEditingApp] = useState(null);
+      const [isAppModalOpen, setIsAppModalOpen] = useState(false);
+      const [isCsvModalOpen, setIsCsvModalOpen] = useState(false);
+
+      // Prompt: Saved -> Applied Optional Application Date Modal
+      const [appliedDatePrompt, setAppliedDatePrompt] = useState(null);
+      // { appId, pendingAppPayload, isQuickStatusChange, tempDate }
+
+      // Prompt: Follow-Up Completed -> Optional Schedule Next Follow-Up
+      const [nextFollowUpPrompt, setNextFollowUpPrompt] = useState(null);
+      // { appId, company, jobTitle, tempDate }
+
+      // Inline Edit Date Popover on Reminder Card
+      const [inlineDateEdit, setInlineDateEdit] = useState(null);
+      // { appId, field: 'deadline' | 'followUpDate', value }
+
+      // Firebase Instance Refs
+      const dbRef = useRef(null);
+      const authRef = useRef(null);
+      const unsubscribeAppsRef = useRef(null);
+      const unsubscribePrefsRef = useRef(null);
+
+      // ------------------------------------------
+      // INITIALIZE AUTH / DEMO MODE
+      // ------------------------------------------
+      useEffect(() => {
+        const storedConfigRaw = localStorage.getItem(STORAGE_KEYS.FIREBASE_CONFIG);
+        const explicitDemo = localStorage.getItem(STORAGE_KEYS.DEMO_MODE) === 'true';
+
+        if (storedConfigRaw) {
+          try {
+            const config = JSON.parse(storedConfigRaw);
+            initFirebaseClient(config);
+          } catch (err) {
+            setCloudError(`Invalid stored Firebase configuration: ${err.message}`);
+            setAuthLoading(false);
+          }
+        } else if (explicitDemo) {
+          activateLocalDemoMode();
+          setAuthLoading(false);
+        } else {
+          setMode('unconfigured');
+          setAuthLoading(false);
+        }
+
+        return () => cleanupListeners();
+      }, []);
+
+      function cleanupListeners() {
+        if (unsubscribeAppsRef.current) {
+          unsubscribeAppsRef.current();
+          unsubscribeAppsRef.current = null;
+        }
+        if (unsubscribePrefsRef.current) {
+          unsubscribePrefsRef.current();
+          unsubscribePrefsRef.current = null;
+        }
+      }
+
+      function initFirebaseClient(config) {
+        setCloudError(null);
+        try {
+          let app;
+          if (!firebase.apps.length) {
+            app = firebase.initializeApp(config);
+          } else {
+            app = firebase.app();
+          }
+          const auth = firebase.auth(app);
+          const db = firebase.firestore(app);
+          authRef.current = auth;
+          dbRef.current = db;
+          setMode('firebase');
+
+          auth.onAuthStateChanged(
+            (fbUser) => {
+              cleanupListeners();
+              setUser(fbUser);
+              setAuthLoading(false);
+              if (fbUser) {
+                attachFirestoreListeners(db, fbUser.uid);
+              } else {
+                setApplications([]);
+              }
+            },
+            (err) => {
+              // Strict Rule: Never silently switch to demo mode
+              setCloudError(`Firebase Authentication error: ${err.message}`);
+              setAuthLoading(false);
+            }
+          );
+        } catch (err) {
+          setCloudError(`Firebase initialization failed: ${err.message}`);
+          setAuthLoading(false);
+        }
+      }
+
+      function attachFirestoreListeners(db, uid) {
+        const appsRef = db.collection('users').doc(uid).collection('applications');
+        unsubscribeAppsRef.current = appsRef.onSnapshot(
+          (snapshot) => {
+            const list = [];
+            snapshot.forEach((doc) => list.push(doc.data()));
+            setApplications(list);
+          },
+          (err) => {
+            setCloudError(
+              `Firestore Read Error (${err.code || 'Error'}): ${err.message}. Verify that your Firestore Security Rules are published and allow /users/{userId} access.`
+            );
+          }
+        );
+
+        const prefsRef = db.collection('users').doc(uid).collection('settings').doc('preferences');
+        unsubscribePrefsRef.current = prefsRef.onSnapshot(
+          (doc) => {
+            if (doc.exists && typeof doc.data().warningWindowDays === 'number') {
+              setWarningWindowDays(doc.data().warningWindowDays);
+            }
+          },
+          () => {} // Ignore preference read error if rules error already caught above
+        );
+      }
+
+      function activateLocalDemoMode() {
+        cleanupListeners();
+        localStorage.setItem(STORAGE_KEYS.DEMO_MODE, 'true');
+        setMode('demo');
+        setUser(null);
+        setCloudError(null);
+        try {
+          const rawApps = localStorage.getItem(STORAGE_KEYS.DEMO_APPS);
+          setApplications(rawApps ? JSON.parse(rawApps) : []);
+          const rawPrefs = localStorage.getItem(STORAGE_KEYS.DEMO_PREFS);
+          if (rawPrefs) {
+            const p = JSON.parse(rawPrefs);
+            if (typeof p.warningWindowDays === 'number') setWarningWindowDays(p.warningWindowDays);
+          }
+        } catch (e) {
+          setApplications([]);
+        }
+      }
+
+      function exitLocalDemoMode() {
+        localStorage.removeItem(STORAGE_KEYS.DEMO_MODE);
+        const hasFb = !!localStorage.getItem(STORAGE_KEYS.FIREBASE_CONFIG);
+        setMode(hasFb ? 'firebase' : 'unconfigured');
+        setApplications([]);
+      }
+
+      async function handleGoogleSignIn() {
+        setCloudError(null);
+        if (!authRef.current) {
+          setShowSetupModal(true);
+          return;
+        }
+        const provider = new firebase.auth.GoogleAuthProvider();
+        provider.setCustomParameters({ prompt: 'select_account' });
+        try {
+          await authRef.current.signInWithPopup(provider);
+          localStorage.removeItem(STORAGE_KEYS.DEMO_MODE);
+        } catch (err) {
+          if (err.code === 'auth/popup-blocked') {
+            try {
+              await authRef.current.signInWithRedirect(provider);
+            } catch (redirErr) {
+              setCloudError(`Google Sign-In failed: ${redirErr.message}`);
+            }
+          } else {
+            setCloudError(
+              `Google Sign-In failed (${err.code || 'Auth Error'}): ${err.message}. Check that Google Sign-In is enabled in Firebase Console and "${window.location.hostname || 'localhost'}" is in Authorized Domains.`
+            );
+          }
+        }
+      }
+
+      async function handleSignOut() {
+        setCloudError(null);
+        if (mode === 'demo') {
+          exitLocalDemoMode();
+          return;
+        }
+        if (authRef.current) {
+          try {
+            await authRef.current.signOut();
+          } catch (err) {
+            setCloudError(`Sign-out error: ${err.message}`);
+          }
+        }
+      }
+
+      // ------------------------------------------
+      // DATA PERSISTENCE OPERATIONS (CLOUD OR DEMO)
+      // ------------------------------------------
+      async function saveWarningWindow(days) {
+        const clamped = Math.max(1, Math.min(60, Number(days) || 3));
+        setWarningWindowDays(clamped);
+        if (mode === 'firebase' && user && dbRef.current) {
+          try {
+            await dbRef.current
+              .collection('users')
+              .doc(user.uid)
+              .collection('settings')
+              .doc('preferences')
+              .set({ warningWindowDays: clamped }, { merge: true });
+          } catch (err) {
+            setCloudError(`Failed to save warning window setting: ${err.message}`);
+          }
+        } else if (mode === 'demo') {
+          localStorage.setItem(STORAGE_KEYS.DEMO_PREFS, JSON.stringify({ warningWindowDays: clamped }));
+        }
+      }
+
+      async function persistApplicationRecord(record) {
+        setCloudError(null);
+        if (mode === 'firebase') {
+          if (!user || !dbRef.current) {
+            setCloudError('Cannot save: You must be signed in with Google to save to Firebase.');
+            throw new Error('Not authenticated');
+          }
+          try {
+            await dbRef.current
+              .collection('users')
+              .doc(user.uid)
+              .collection('applications')
+              .doc(record.id)
+              .set(record);
+          } catch (err) {
+            // Strict rule: Never silently switch to demo mode when cloud saving fails
+            setCloudError(`Failed to save application to Cloud Firestore: ${err.message}`);
+            throw err;
+          }
+        } else if (mode === 'demo') {
+          setApplications((prev) => {
+            const exists = prev.some((a) => a.id === record.id);
+            const next = exists
+              ? prev.map((a) => (a.id === record.id ? record : a))
+              : [record, ...prev];
+            localStorage.setItem(STORAGE_KEYS.DEMO_APPS, JSON.stringify(next));
+            return next;
+          });
+        } else {
+          setCloudError('Storage is not configured. Connect Firebase or enter Local Demo Mode.');
+          throw new Error('Unconfigured storage');
+        }
+      }
+
+      async function deleteApplicationRecord(id) {
+        setCloudError(null);
+        if (mode === 'firebase') {
+          if (!user || !dbRef.current) {
+            setCloudError('Cannot delete: Not signed in.');
+            return;
+          }
+          try {
+            await dbRef.current
+              .collection('users')
+              .doc(user.uid)
+              .collection('applications')
+              .doc(id)
+              .delete();
+          } catch (err) {
+            setCloudError(`Failed to delete record from Firestore: ${err.message}`);
+          }
+        } else if (mode === 'demo') {
+          setApplications((prev) => {
+            const next = prev.filter((a) => a.id !== id);
+            localStorage.setItem(STORAGE_KEYS.DEMO_APPS, JSON.stringify(next));
+            return next;
+          });
+        }
+      }
+
+      // ------------------------------------------
+      // STATUS TRANSITION & FOLLOW-UP QUICK ACTIONS
+      // ------------------------------------------
+      async function handleQuickStatusChange(app, newStatus) {
+        if (app.status === newStatus) return;
+        const now = new Date().toISOString();
+        const statusEvent = {
+          id: generateId('evt'),
+          timestamp: now,
+          type: 'status_change',
+          detail: `Status changed from ${app.status} to ${newStatus}`
+        };
+        const updatedApp = {
+          ...app,
+          status: newStatus,
+          activityHistory: [...(app.activityHistory || []), statusEvent],
+          updatedAt: now
+        };
+
+        // Rule: Changing Saved -> Applied with blank applicationDate leaves it blank & offers optional prompt
+        if (app.status === 'Saved' && newStatus === 'Applied' && !app.applicationDate) {
+          await persistApplicationRecord(updatedApp);
+          setAppliedDatePrompt({
+            appId: updatedApp.id,
+            company: updatedApp.company,
+            jobTitle: updatedApp.jobTitle,
+            tempDate: getLocalTodayStr()
+          });
+        } else {
+          await persistApplicationRecord(updatedApp);
+        }
+      }
+
+      async function handleMarkFollowedUp(app) {
+        const todayStr = getLocalTodayStr();
+        const now = new Date().toISOString();
+        const followUpEvent = {
+          id: generateId('evt'),
+          timestamp: now,
+          type: 'followed_up',
+          detail: `Completed follow-up on ${todayStr}`
+        };
+        const updatedApp = {
+          ...app,
+          followUpDate: '', // Clear reminder; never automatically bump forward
+          activityHistory: [...(app.activityHistory || []), followUpEvent],
+          updatedAt: now
+        };
+        await persistApplicationRecord(updatedApp);
+        setNextFollowUpPrompt({
+          appId: updatedApp.id,
+          company: updatedApp.company,
+          jobTitle: updatedApp.jobTitle,
+          tempDate: ''
+        });
+      }
+
+      async function handleSaveInlineDate() {
+        if (!inlineDateEdit) return;
+        const target = applications.find((a) => a.id === inlineDateEdit.appId);
+        if (!target) {
+          setInlineDateEdit(null);
+          return;
+        }
+        const updated = {
+          ...target,
+          [inlineDateEdit.field]: inlineDateEdit.value || '',
+          updatedAt: new Date().toISOString()
+        };
+        await persistApplicationRecord(updated);
+        setInlineDateEdit(null);
+      }
+
+      // ------------------------------------------
+      // COMPUTED REMINDERS & ALERTS
+      // ------------------------------------------
+      const todayLocal = getLocalTodayStr();
+
+      const activeAlerts = useMemo(() => {
+        const list = [];
+        for (const app of applications) {
+          // Rule: Hide alerts for Rejected and Withdrawn without deleting dates
+          if (app.status === 'Rejected' || app.status === 'Withdrawn') continue;
+
+          // Rule: Application deadline alerts ONLY shown while status is Saved
+          if (app.status === 'Saved' && app.deadline) {
+            const diff = diffDaysLocal(app.deadline, todayLocal);
+            if (diff !== null && diff <= warningWindowDays) {
+              list.push({
+                key: `${app.id}_deadline`,
+                app,
+                alertType: 'Deadline',
+                field: 'deadline',
+                targetDate: app.deadline,
+                diffDays: diff,
+                urgency: diff < 0 ? 'Overdue' : diff === 0 ? 'Due today' : 'Approaching'
+              });
+            }
+          }
+
+          // Rule: Follow-up reminders active for Saved, Applied, Assessment, Interview, and Offer
+          if (app.followUpDate) {
+            const diff = diffDaysLocal(app.followUpDate, todayLocal);
+            if (diff !== null && diff <= warningWindowDays) {
+              list.push({
+                key: `${app.id}_followup`,
+                app,
+                alertType: 'Follow-up',
+                field: 'followUpDate',
+                targetDate: app.followUpDate,
+                diffDays: diff,
+                urgency: diff < 0 ? 'Overdue' : diff === 0 ? 'Due today' : 'Approaching'
+              });
+            }
+          }
+        }
+        return list.sort((a, b) => a.diffDays - b.diffDays);
+      }, [applications, todayLocal, warningWindowDays]);
+
+      // ------------------------------------------
+      // COMPUTED STATUS COUNTS & FILTERED LIST
+      // ------------------------------------------
+      const statusCounts = useMemo(() => {
+        const counts = { All: applications.length };
+        for (const st of ALLOWED_STATUSES) counts[st] = 0;
+        for (const app of applications) {
+          if (counts[app.status] !== undefined) counts[app.status]++;
+        }
+        return counts;
+      }, [applications]);
+
+      const filteredAndSortedApps = useMemo(() => {
+        const q = searchQuery.trim().toLowerCase();
+        const filtered = applications.filter((app) => {
+          if (statusFilter !== 'All' && app.status !== statusFilter) return false;
+          if (!q) return true;
+          return (
+            (app.company || '').toLowerCase().includes(q) ||
+            (app.jobTitle || '').toLowerCase().includes(q) ||
+            (app.location || '').toLowerCase().includes(q) ||
+            (app.notes || '').toLowerCase().includes(q) ||
+            (app.salaryRange || '').toLowerCase().includes(q)
+          );
+        });
+
+        return filtered.sort((a, b) => {
+          let cmp = 0;
+          if (sortBy === 'company') {
+            cmp = (a.company || '').localeCompare(b.company || '');
+          } else if (sortBy === 'status') {
+            cmp = ALLOWED_STATUSES.indexOf(a.status) - ALLOWED_STATUSES.indexOf(b.status);
+          } else if (sortBy === 'deadline' || sortBy === 'followUpDate' || sortBy === 'applicationDate') {
+            const va = a[sortBy] || '';
+            const vb = b[sortBy] || '';
+            if (!va && !vb) cmp = 0;
+            else if (!va) cmp = 1;
+            else if (!vb) cmp = -1;
+            else cmp = va.localeCompare(vb);
+          } else {
+            cmp = new Date(a.updatedAt || 0).getTime() - new Date(b.updatedAt || 0).getTime();
+          }
+          return sortAsc ? cmp : -cmp;
+        });
+      }, [applications, searchQuery, statusFilter, sortBy, sortAsc]);
+
+      function handleExportCsvFile() {
+        const csvString = serializeApplicationsToCsv(applications);
+        const blob = new Blob([csvString], { type: 'text/csv;charset=utf-8;' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `application-command-center-backup-${todayLocal}.csv`;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+      }
+
+      // ==========================================
+      // RENDER: UNCONFIGURED OR SIGNED-OUT LANDING
+      // ==========================================
+      const isSignedInCloud = mode === 'firebase' && !!user;
+      const isDemoActive = mode === 'demo';
+
+      if (!authLoading && !isSignedInCloud && !isDemoActive) {
+        return (
+          <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col justify-between p-4 sm:p-8">
+            <div className="max-w-3xl w-full mx-auto my-auto space-y-6">
+              {/* Welcome Card */}
+              <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 sm:p-8 shadow-2xl space-y-5">
+                <div className="flex items-center justify-between flex-wrap gap-3">
+                  <div>
+                    <span className="text-xs font-mono uppercase tracking-widest px-2.5 py-1 rounded bg-indigo-950 text-indigo-300 border border-indigo-800/60">
+                      Linux • SysAdmin • Cloud Engineering
+                    </span>
+                    <h1 className="text-2xl sm:text-3xl font-bold text-white mt-3">
+                      Application Command Center
+                    </h1>
+                  </div>
+                </div>
+
+                <p className="text-sm text-slate-300 leading-relaxed">
+                  Track your Linux Administrator, Systems Administrator, and Cloud Engineering job applications in one place. Catch approaching deadlines, stay on top of follow-ups, prevent duplicate submissions, and keep full CSV backups.
+                </p>
+
+                {cloudError && (
+                  <div className="p-4 rounded-xl bg-rose-950/80 border border-rose-600/60 text-rose-200 text-xs space-y-1">
+                    <div className="font-bold text-rose-300">Cloud Authentication / Configuration Error</div>
+                    <div>{cloudError}</div>
+                  </div>
+                )}
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 pt-2">
+                  {/* Option 1: Cloud Sync with Google Sign-In */}
+                  <div className="p-5 rounded-xl bg-slate-950 border border-slate-800 flex flex-col justify-between space-y-4">
+                    <div>
+                      <h2 className="text-base font-semibold text-white">Cloud-Synced Account</h2>
+                      <p className="text-xs text-slate-400 mt-1 leading-relaxed">
+                        Sign in with Google to sync applications automatically across your computers and phone with private per-user Firestore rules.
+                      </p>
+                    </div>
+                    <div className="space-y-2">
+                      {mode === 'firebase' ? (
+                        <button
+                          onClick={handleGoogleSignIn}
+                          className="w-full py-2.5 px-4 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white font-semibold text-xs transition shadow"
+                        >
+                          Sign In with Google
+                        </button>
+                      ) : null}
+                      <button
+                        onClick={() => setShowSetupModal(true)}
+                        className="w-full py-2.5 px-4 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 font-medium text-xs transition"
+                      >
+                        {mode === 'firebase' ? 'Edit Firebase Setup & Rules' : 'Configure Firebase & Security Rules'}
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Option 2: Explicit Local Demo Mode */}
+                  <div className="p-5 rounded-xl bg-slate-950 border border-amber-800/40 flex flex-col justify-between space-y-4">
+                    <div>
+                      <div className="flex items-center justify-between">
+                        <h2 className="text-base font-semibold text-amber-300">Local Demo Mode</h2>
+                        <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-amber-950 text-amber-300 border border-amber-700/50">
+                          Browser-Only
+                        </span>
+                      </div>
+                      <p className="text-xs text-slate-400 mt-1 leading-relaxed">
+                        Test all features immediately before connecting Firebase. Demo data stays strictly in this browser (<code className="text-slate-300">localStorage</code>) and does <strong>not</strong> sync across devices.
+                      </p>
+                    </div>
+                    <button
+                      onClick={activateLocalDemoMode}
+                      className="w-full py-2.5 px-4 rounded-lg bg-amber-600 hover:bg-amber-500 text-slate-950 font-bold text-xs transition shadow"
+                    >
+                      Enter Local Demo Mode (Browser-Only)
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            {showSetupModal && (
+              <FirebaseSetupModal
+                onClose={() => setShowSetupModal(false)}
+                onSaveConfig={(cfg) => {
+                  localStorage.setItem(STORAGE_KEYS.FIREBASE_CONFIG, JSON.stringify(cfg));
+                  localStorage.removeItem(STORAGE_KEYS.DEMO_MODE);
+                  setShowSetupModal(false);
+                  initFirebaseClient(cfg);
+                }}
+                onClearConfig={() => {
+                  localStorage.removeItem(STORAGE_KEYS.FIREBASE_CONFIG);
+                  setMode('unconfigured');
+                  setShowSetupModal(false);
+                }}
+              />
+            )}
+          </div>
+        );
+      }
+
+      // ==========================================
+      // RENDER: MAIN AUTHENTICATED / DEMO DASHBOARD
+      // ==========================================
+      return (
+        <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col">
+          {/* Explicit Local Demo Mode Banner */}
+          {isDemoActive && (
+            <div className="bg-amber-950/90 border-b border-amber-700/60 px-4 py-2 text-xs text-amber-200 flex items-center justify-between flex-wrap gap-2">
+              <div>
+                <strong className="text-amber-300 font-mono">LOCAL DEMO MODE:</strong> Data is stored only in this browser and does NOT sync across devices. Use CSV Export to back up your data.
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={() => setShowSetupModal(true)}
+                  className="px-2.5 py-1 rounded bg-amber-900/70 hover:bg-amber-800 text-amber-100 border border-amber-600/50 font-medium"
+                >
+                  Connect Firebase Cloud
+                </button>
+                <button
+                  onClick={exitLocalDemoMode}
+                  className="px-2.5 py-1 rounded bg-slate-900 hover:bg-slate-800 text-slate-300"
+                >
+                  Exit Demo
+                </button>
+              </div>
+            </div>
+          )}
+
+          {/* Header Bar */}
+          <header className="bg-slate-900 border-b border-slate-800 sticky top-0 z-20">
+            <div className="max-w-7xl mx-auto px-4 sm:px-6 py-3.5 flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <div className="flex items-center gap-2.5">
+                  <span className="w-2.5 h-2.5 rounded-full bg-emerald-400"></span>
+                  <h1 className="text-lg font-bold text-white tracking-tight">
+                    Application Command Center
+                  </h1>
+                </div>
+                <p className="text-xs text-slate-400 mt-0.5">
+                  {isSignedInCloud
+                    ? `Welcome, ${user.displayName || user.email} • Cloud Synced`
+                    : 'Welcome • Local Browser Demo Workspace'}
+                </p>
+              </div>
+
+              <div className="flex items-center flex-wrap gap-2">
+                {/* Adjustable Warning Window Setting */}
+                <div className="flex items-center gap-1.5 bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-1.5 text-xs">
+                  <span className="text-slate-400">Alert window:</span>
+                  <input
+                    type="number"
+                    min="1"
+                    max="60"
+                    value={warningWindowDays}
+                    onChange={(e) => saveWarningWindow(e.target.value)}
+                    className="w-12 bg-slate-900 border border-slate-700 rounded px-1.5 py-0.5 text-center font-mono text-white"
+                  />
+                  <span className="text-slate-400">days</span>
+                </div>
+
+                <button
+                  onClick={() => setIsCsvModalOpen(true)}
+                  className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-xs font-medium text-slate-200 transition"
+                >
+                  Import CSV
+                </button>
+                <button
+                  onClick={handleExportCsvFile}
+                  className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-xs font-medium text-slate-200 transition"
+                >
+                  Export CSV
+                </button>
+                <button
+                  onClick={() => {
+                    setEditingApp(null);
+                    setIsAppModalOpen(true);
+                  }}
+                  className="px-3.5 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-xs font-semibold text-white shadow transition"
+                >
+                  + Add Application
+                </button>
+                <button
+                  onClick={() => setShowSetupModal(true)}
+                  className="px-2.5 py-1.5 rounded-lg bg-slate-950 hover:bg-slate-800 border border-slate-800 text-xs text-slate-400 hover:text-white"
+                  title="Firebase & Security Setup"
+                >
+                  Firebase Setup
+                </button>
+                {isSignedInCloud && (
+                  <button
+                    onClick={handleSignOut}
+                    className="px-2.5 py-1.5 rounded-lg bg-slate-950 hover:bg-rose-950/60 border border-slate-800 text-xs text-slate-400 hover:text-rose-300"
+                  >
+                    Sign Out
+                  </button>
+                )}
+              </div>
+            </div>
+          </header>
+
+          {/* Main Dashboard Body */}
+          <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 py-6 space-y-6">
+            {/* Cloud Error Banner */}
+            {cloudError && (
+              <div className="p-4 rounded-xl bg-rose-950/90 border border-rose-600 text-rose-200 text-xs flex items-start justify-between gap-4">
+                <div>
+                  <span className="font-bold text-rose-300 block">Cloud Error (No Silent Fallback):</span>
+                  <span>{cloudError}</span>
+                </div>
+                <button onClick={() => setCloudError(null)} className="text-rose-300 hover:text-white font-bold">✕</button>
+              </div>
+            )}
+
+            {/* 1. TOP SECTION: DUE & OVERDUE REMINDERS */}
+            <section className="bg-slate-900 border border-slate-800 rounded-xl p-4 sm:p-5 space-y-3">
+              <div className="flex items-center justify-between flex-wrap gap-2">
+                <div className="flex items-center gap-2">
+                  <h2 className="text-sm font-bold uppercase tracking-wider text-slate-200">
+                    Deadlines & Follow-Up Reminders
+                  </h2>
+                  <span className="text-xs font-mono px-2 py-0.5 rounded-full bg-slate-800 text-slate-300 border border-slate-700">
+                    {activeAlerts.length} active
+                  </span>
+                </div>
+                <span className="text-[11px] text-slate-400 font-mono">
+                  Local Date: {todayLocal} (Flagging up to {warningWindowDays}d ahead)
+                </span>
+              </div>
+
+              {activeAlerts.length === 0 ? (
+                <div className="p-4 rounded-lg bg-slate-950/70 border border-slate-800/80 text-xs text-slate-400 flex items-center justify-between">
+                  <span>
+                    All clear — no deadlines (for Saved roles) or follow-ups due within the next {warningWindowDays} {warningWindowDays === 1 ? 'day' : 'days'}.
+                  </span>
+                </div>
+              ) : (
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                  {activeAlerts.map((item) => {
+                    const urgencyStyles =
+                      item.urgency === 'Overdue'
+                        ? 'bg-rose-950/60 border-rose-600/50 text-rose-200'
+                        : item.urgency === 'Due today'
+                        ? 'bg-amber-950/60 border-amber-600/50 text-amber-200'
+                        : 'bg-indigo-950/50 border-indigo-700/50 text-indigo-200';
+
+                    const badgeStyles =
+                      item.urgency === 'Overdue'
+                        ? 'bg-rose-600 text-white'
+                        : item.urgency === 'Due today'
+                        ? 'bg-amber-500 text-slate-950'
+                        : 'bg-indigo-600 text-white';
+
+                    const isEditingThisDate =
+                      inlineDateEdit &&
+                      inlineDateEdit.appId === item.app.id &&
+                      inlineDateEdit.field === item.field;
+
+                    return (
+                      <div
+                        key={item.key}
+                        className={`p-3.5 rounded-xl border flex flex-col justify-between gap-3 ${urgencyStyles}`}
+                      >
+                        <div className="flex items-start justify-between gap-2">
+                          <div>
+                            <div className="flex items-center gap-2 flex-wrap">
+                              <span className={`text-[10px] font-bold uppercase px-2 py-0.5 rounded ${badgeStyles}`}>
+                                {item.urgency}
+                              </span>
+                              <span className="text-xs font-mono font-semibold">
+                                {item.alertType}: {item.targetDate}
+                              </span>
+                              <span className={`text-[10px] px-2 py-0.5 rounded-full border ${getStatusBadgeClasses(item.app.status)}`}>
+                                {item.app.status}
+                              </span>
+                            </div>
+                            <h3 className="text-sm font-bold text-white mt-1.5">
+                              {item.app.company} — <span className="font-normal text-slate-200">{item.app.jobTitle}</span>
+                            </h3>
+                          </div>
+                        </div>
+
+                        {isEditingThisDate ? (
+                          <div className="flex items-center gap-2 bg-slate-950/90 p-2 rounded-lg border border-slate-700">
+                            <input
+                              type="date"
+                              value={inlineDateEdit.value}
+                              onChange={(e) => setInlineDateEdit({ ...inlineDateEdit, value: e.target.value })}
+                              className="bg-slate-900 border border-slate-700 rounded px-2 py-1 text-xs font-mono text-white"
+                            />
+                            <button
+                              onClick={handleSaveInlineDate}
+                              className="px-2.5 py-1 bg-emerald-600 hover:bg-emerald-500 text-white rounded text-xs font-medium"
+                            >
+                              Save
+                            </button>
+                            <button
+                              onClick={() => setInlineDateEdit({ ...inlineDateEdit, value: '' })}
+                              className="px-2 py-1 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded text-xs"
+                              title="Clear date"
+                            >
+                              Clear
+                            </button>
+                            <button
+                              onClick={() => setInlineDateEdit(null)}
+                              className="px-2 py-1 text-slate-400 hover:text-white text-xs"
+                            >
+                              Cancel
+                            </button>
+                          </div>
+                        ) : (
+                          <div className="flex items-center flex-wrap gap-2 pt-1">
+                            <button
+                              onClick={() => {
+                                setEditingApp(item.app);
+                                setIsAppModalOpen(true);
+                              }}
+                              className="px-2.5 py-1 rounded bg-slate-900/90 hover:bg-slate-800 text-slate-100 border border-slate-700 text-xs font-medium"
+                            >
+                              Open application
+                            </button>
+                            <button
+                              onClick={() =>
+                                setInlineDateEdit({
+                                  appId: item.app.id,
+                                  field: item.field,
+                                  value: item.targetDate || ''
+                                })
+                              }
+                              className="px-2.5 py-1 rounded bg-slate-900/90 hover:bg-slate-800 text-slate-100 border border-slate-700 text-xs font-medium"
+                            >
+                              Edit date
+                            </button>
+                            {item.alertType === 'Follow-up' && (
+                              <button
+                                onClick={() => handleMarkFollowedUp(item.app)}
+                                className="px-2.5 py-1 rounded bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold shadow"
+                              >
+                                ✓ Mark followed up
+                              </button>
+                            )}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </section>
+
+            {/* 2. SECOND SECTION: APPLICATION TOTALS BY STATUS */}
+            <section className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-8 gap-2.5">
+              {['All', ...ALLOWED_STATUSES].map((st) => {
+                const active = statusFilter === st;
+                return (
+                  <button
+                    key={st}
+                    onClick={() => setStatusFilter(st)}
+                    className={`p-3 rounded-xl border text-left transition ${
+                      active
+                        ? 'bg-indigo-950/80 border-indigo-500 text-white shadow'
+                        : 'bg-slate-900 border-slate-800 text-slate-300 hover:border-slate-700'
+                    }`}
+                  >
+                    <div className="text-[11px] uppercase tracking-wider text-slate-400 font-semibold truncate">
+                      {st}
+                    </div>
+                    <div className="text-xl font-bold font-mono text-white mt-1">
+                      {statusCounts[st] || 0}
+                    </div>
+                  </button>
+                );
+              })}
+            </section>
+
+            {/* 3. SEARCH, FILTER & SORT BAR */}
+            <section className="bg-slate-900 border border-slate-800 rounded-xl p-3.5 flex flex-col md:flex-row items-stretch md:items-center justify-between gap-3">
+              <div className="flex-1 flex items-center gap-2">
+                <input
+                  type="text"
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                  placeholder="Search company, Linux/Cloud title, location, salary, or notes..."
+                  className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3.5 py-2 text-xs text-slate-100 placeholder:text-slate-500 focus:outline-none focus:border-indigo-500"
+                />
+                {(searchQuery || statusFilter !== 'All') && (
+                  <button
+                    onClick={() => {
+                      setSearchQuery('');
+                      setStatusFilter('All');
+                    }}
+                    className="px-3 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs text-slate-300 whitespace-nowrap"
+                  >
+                    Reset
+                  </button>
+                )}
+              </div>
+
+              <div className="flex items-center gap-2 flex-wrap">
+                <label className="text-xs text-slate-400">Status:</label>
+                <select
+                  value={statusFilter}
+                  onChange={(e) => setStatusFilter(e.target.value)}
+                  className="bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-1.5 text-xs text-slate-200"
+                >
+                  <option value="All">All Statuses</option>
+                  {ALLOWED_STATUSES.map((st) => (
+                    <option key={st} value={st}>{st}</option>
+                  ))}
+                </select>
+
+                <label className="text-xs text-slate-400 ml-1">Sort by:</label>
+                <select
+                  value={sortBy}
+                  onChange={(e) => setSortBy(e.target.value)}
+                  className="bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-1.5 text-xs text-slate-200"
+                >
+                  <option value="updatedAt">Last Updated</option>
+                  <option value="deadline">Deadline</option>
+                  <option value="followUpDate">Follow-up Date</option>
+                  <option value="applicationDate">Application Date</option>
+                  <option value="company">Company Name</option>
+                  <option value="status">Status</option>
+                </select>
+
+                <button
+                  onClick={() => setSortAsc(!sortAsc)}
+                  className="px-2.5 py-1.5 rounded-lg bg-slate-950 border border-slate-800 text-xs font-mono text-slate-300 hover:text-white"
+                  title="Toggle sort direction"
+                >
+                  {sortAsc ? '↑ Asc' : '↓ Desc'}
+                </button>
+              </div>
+            </section>
+
+            {/* 4. MAIN APPLICATIONS LIST (TABLE ON DESKTOP, CARDS ON MOBILE) */}
+            {applications.length === 0 ? (
+              <div className="bg-slate-900 border border-slate-800 rounded-2xl p-10 text-center space-y-4">
+                <h3 className="text-base font-bold text-white">
+                  Your Application Command Center is Empty
+                </h3>
+                <p className="text-xs text-slate-400 max-w-md mx-auto leading-relaxed">
+                  Start tracking your Linux Administrator, Systems Administrator, and Cloud Engineering applications. Only Company, Job Title, and Status are required—all other fields are optional.
+                </p>
+                <div className="flex items-center justify-center gap-3 pt-2">
+                  <button
+                    onClick={() => {
+                      setEditingApp(null);
+                      setIsAppModalOpen(true);
+                    }}
+                    className="px-4 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-xs font-semibold text-white shadow"
+                  >
+                    + Add First Application
+                  </button>
+                  <button
+                    onClick={() => setIsCsvModalOpen(true)}
+                    className="px-4 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-xs font-medium text-slate-200"
+                  >
+                    Import CSV Backup
+                  </button>
+                </div>
+              </div>
+            ) : filteredAndSortedApps.length === 0 ? (
+              <div className="bg-slate-900 border border-slate-800 rounded-xl p-8 text-center space-y-3">
+                <p className="text-sm font-semibold text-slate-200">No applications match your current search or filter.</p>
+                <button
+                  onClick={() => {
+                    setSearchQuery('');
+                    setStatusFilter('All');
+                  }}
+                  className="px-3.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs text-indigo-300 border border-slate-700"
+                >
+                  Clear Search & Filters
+                </button>
+              </div>
+            ) : (
+              <>
+                {/* DESKTOP VIEW: SEARCHABLE, SORTABLE TABLE */}
+                <div className="hidden md:block bg-slate-900 border border-slate-800 rounded-xl overflow-hidden shadow-sm">
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-left text-xs text-slate-300">
+                      <thead className="bg-slate-950 border-b border-slate-800 text-[11px] uppercase tracking-wider text-slate-400 font-semibold">
+                        <tr>
+                          <th className="py-3 px-4">Company & Role</th>
+                          <th className="py-3 px-4">Status</th>
+                          <th className="py-3 px-4">Location & Salary</th>
+                          <th className="py-3 px-4">Applied Date</th>
+                          <th className="py-3 px-4">Deadline</th>
+                          <th className="py-3 px-4">Follow-Up</th>
+                          <th className="py-3 px-4 text-right">Actions</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-800/80">
+                        {filteredAndSortedApps.map((app) => (
+                          <tr
+                            key={app.id}
+                            onClick={() => {
+                              setEditingApp(app);
+                              setIsAppModalOpen(true);
+                            }}
+                            className="hover:bg-slate-800/50 transition cursor-pointer"
+                          >
+                            <td className="py-3.5 px-4">
+                              <div className="font-bold text-white text-sm flex items-center gap-2">
+                                <span>{app.company}</span>
+                                {app.postingUrl && (
+                                  <a
+                                    href={app.postingUrl}
+                                    target="_blank"
+                                    rel="noreferrer"
+                                    onClick={(e) => e.stopPropagation()}
+                                    className="text-xs font-mono text-indigo-400 hover:text-indigo-300 underline"
+                                    title={app.postingUrl}
+                                  >
+                                    [Posting ↗]
+                                  </a>
+                                )}
+                              </div>
+                              <div className="text-slate-300 font-mono text-xs mt-0.5">{app.jobTitle}</div>
+                              {app.notes && (
+                                <div className="text-[11px] text-slate-500 truncate max-w-xs mt-0.5">
+                                  {app.notes}
+                                </div>
+                              )}
+                            </td>
+
+                            <td className="py-3.5 px-4" onClick={(e) => e.stopPropagation()}>
+                              <select
+                                value={app.status}
+                                onChange={(e) => handleQuickStatusChange(app, e.target.value)}
+                                className={`text-xs px-2.5 py-1 rounded-full font-semibold border cursor-pointer focus:outline-none ${getStatusBadgeClasses(app.status)}`}
+                              >
+                                {ALLOWED_STATUSES.map((st) => (
+                                  <option key={st} value={st} className="bg-slate-900 text-slate-100">
+                                    {st}
+                                  </option>
+                                ))}
+                              </select>
+                            </td>
+
+                            <td className="py-3.5 px-4">
+                              <div className="text-slate-200">{app.location || <span className="text-slate-600">—</span>}</div>
+                              <div className="text-[11px] font-mono text-slate-400 mt-0.5">
+                                {app.salaryRange || <span className="text-slate-600">—</span>}
+                              </div>
+                            </td>
+
+                            <td className="py-3.5 px-4 font-mono text-xs">
+                              {app.applicationDate || <span className="text-slate-600">—</span>}
+                            </td>
+
+                            <td className="py-3.5 px-4 font-mono text-xs">
+                              {app.deadline || <span className="text-slate-600">—</span>}
+                            </td>
+
+                            <td className="py-3.5 px-4 font-mono text-xs">
+                              {app.followUpDate || <span className="text-slate-600">—</span>}
+                            </td>
+
+                            <td className="py-3.5 px-4 text-right whitespace-nowrap" onClick={(e) => e.stopPropagation()}>
+                              <button
+                                onClick={() => {
+                                  setEditingApp(app);
+                                  setIsAppModalOpen(true);
+                                }}
+                                className="px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs mr-1.5"
+                              >
+                                Edit / History
+                              </button>
+                              <button
+                                onClick={() => {
+                                  if (window.confirm(`Delete application for ${app.company} (${app.jobTitle})?`)) {
+                                    deleteApplicationRecord(app.id);
+                                  }
+                                }}
+                                className="px-2.5 py-1 rounded bg-slate-950 hover:bg-rose-950 text-slate-400 hover:text-rose-300 border border-slate-800 text-xs"
+                              >
+                                Delete
+                              </button>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+
+                {/* MOBILE VIEW: COMPACT CARDS */}
+                <div className="md:hidden space-y-3">
+                  {filteredAndSortedApps.map((app) => (
+                    <div
+                      key={app.id}
+                      onClick={() => {
+                        setEditingApp(app);
+                        setIsAppModalOpen(true);
+                      }}
+                      className="bg-slate-900 border border-slate-800 rounded-xl p-4 space-y-3 cursor-pointer"
+                    >
+                      <div className="flex items-start justify-between gap-2">
+                        <div>
+                          <div className="font-bold text-white text-sm flex items-center gap-2">
+                            <span>{app.company}</span>
+                            {app.postingUrl && (
+                              <a
+                                href={app.postingUrl}
+                                target="_blank"
+                                rel="noreferrer"
+                                onClick={(e) => e.stopPropagation()}
+                                className="text-xs font-mono text-indigo-400 underline"
+                              >
+                                [Link ↗]
+                              </a>
+                            )}
+                          </div>
+                          <div className="text-xs font-mono text-slate-300 mt-0.5">{app.jobTitle}</div>
+                        </div>
+
+                        <div onClick={(e) => e.stopPropagation()}>
+                          <select
+                            value={app.status}
+                            onChange={(e) => handleQuickStatusChange(app, e.target.value)}
+                            className={`text-xs px-2.5 py-1 rounded-full font-semibold border ${getStatusBadgeClasses(app.status)}`}
+                          >
+                            {ALLOWED_STATUSES.map((st) => (
+                              <option key={st} value={st} className="bg-slate-900 text-slate-100">{st}</option>
+                            ))}
+                          </select>
+                        </div>
+                      </div>
+
+                      {(app.location || app.salaryRange) && (
+                        <div className="flex flex-wrap gap-2 text-xs text-slate-400">
+                          {app.location && <span>📍 {app.location}</span>}
+                          {app.salaryRange && <span className="font-mono">💰 {app.salaryRange}</span>}
+                        </div>
+                      )}
+
+                      <div className="grid grid-cols-3 gap-2 pt-2 border-t border-slate-800/80 text-[11px] font-mono">
+                        <div>
+                          <span className="text-slate-500 block">Applied</span>
+                          <span className="text-slate-300">{app.applicationDate || '—'}</span>
+                        </div>
+                        <div>
+                          <span className="text-slate-500 block">Deadline</span>
+                          <span className="text-slate-300">{app.deadline || '—'}</span>
+                        </div>
+                        <div>
+                          <span className="text-slate-500 block">Follow-Up</span>
+                          <span className="text-slate-300">{app.followUpDate || '—'}</span>
+                        </div>
+                      </div>
+
+                      <div className="flex items-center justify-end gap-2 pt-1" onClick={(e) => e.stopPropagation()}>
+                        <button
+                          onClick={() => {
+                            setEditingApp(app);
+                            setIsAppModalOpen(true);
+                          }}
+                          className="px-3 py-1 rounded bg-slate-800 text-slate-200 text-xs"
+                        >
+                          Open / History
+                        </button>
+                        <button
+                          onClick={() => {
+                            if (window.confirm(`Delete ${app.company} — ${app.jobTitle}?`)) {
+                              deleteApplicationRecord(app.id);
+                            }
+                          }}
+                          className="px-3 py-1 rounded bg-slate-950 text-rose-400 border border-slate-800 text-xs"
+                        >
+                          Delete
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </>
+            )}
+          </main>
+
+          {/* ========================================== */}
+          {/* MODAL: ADD / EDIT APPLICATION & HISTORY    */}
+          {/* ========================================== */}
+          {isAppModalOpen && (
+            <ApplicationFormModal
+              existingApp={editingApp}
+              allApplications={applications}
+              onClose={() => setIsAppModalOpen(false)}
+              onSwitchToExisting={(targetApp) => setEditingApp(targetApp)}
+              onSave={async (savedApp, promptForAppliedDate) => {
+                await persistApplicationRecord(savedApp);
+                setIsAppModalOpen(false);
+                if (promptForAppliedDate) {
+                  setAppliedDatePrompt({
+                    appId: savedApp.id,
+                    company: savedApp.company,
+                    jobTitle: savedApp.jobTitle,
+                    tempDate: getLocalTodayStr()
+                  });
+                }
+              }}
+            />
+          )}
+
+          {/* ========================================== */}
+          {/* MODAL: SAVED -> APPLIED OPTIONAL DATE      */}
+          {/* ========================================== */}
+          {appliedDatePrompt && (
+            <div className="fixed inset-0 z-50 bg-black/75 flex items-center justify-center p-4">
+              <div className="bg-slate-900 border border-slate-700 rounded-xl max-w-md w-full p-6 space-y-4 shadow-2xl">
+                <h3 className="text-base font-bold text-white">
+                  Set Application Date? (Optional)
+                </h3>
+                <p className="text-xs text-slate-300 leading-relaxed">
+                  You changed <strong>{appliedDatePrompt.company} — {appliedDatePrompt.jobTitle}</strong> to <strong>Applied</strong>. The status change timestamp has been recorded in Activity History. Would you also like to set an Application Date, or leave it blank?
+                </p>
+                <div>
+                  <label className="block text-xs text-slate-400 mb-1">Application Date</label>
+                  <input
+                    type="date"
+                    value={appliedDatePrompt.tempDate}
+                    onChange={(e) => setAppliedDatePrompt({ ...appliedDatePrompt, tempDate: e.target.value })}
+                    className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-xs font-mono text-white"
+                  />
+                </div>
+                <div className="flex items-center justify-end gap-2 pt-2">
+                  <button
+                    onClick={() => setAppliedDatePrompt(null)}
+                    className="px-4 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs font-medium text-slate-200"
+                  >
+                    Skip (Leave Blank)
+                  </button>
+                  <button
+                    onClick={async () => {
+                      const target = applications.find((a) => a.id === appliedDatePrompt.appId);
+                      if (target && appliedDatePrompt.tempDate) {
+                        await persistApplicationRecord({
+                          ...target,
+                          applicationDate: appliedDatePrompt.tempDate,
+                          updatedAt: new Date().toISOString()
+                        });
+                      }
+                      setAppliedDatePrompt(null);
+                    }}
+                    className="px-4 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-xs font-semibold text-white"
+                  >
+                    Save Application Date
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* ========================================== */}
+          {/* MODAL: SCHEDULE NEXT FOLLOW-UP PROMPT      */}
+          {/* ========================================== */}
+          {nextFollowUpPrompt && (
+            <div className="fixed inset-0 z-50 bg-black/75 flex items-center justify-center p-4">
+              <div className="bg-slate-900 border border-slate-700 rounded-xl max-w-md w-full p-6 space-y-4 shadow-2xl">
+                <h3 className="text-base font-bold text-emerald-400">
+                  ✓ Follow-Up Recorded in Activity History
+                </h3>
+                <p className="text-xs text-slate-300 leading-relaxed">
+                  Today's follow-up for <strong>{nextFollowUpPrompt.company} — {nextFollowUpPrompt.jobTitle}</strong> was logged and the reminder was cleared. Would you like to schedule another follow-up date?
+                </p>
+                <div>
+                  <label className="block text-xs text-slate-400 mb-1">Next Follow-Up Date (Optional)</label>
+                  <input
+                    type="date"
+                    value={nextFollowUpPrompt.tempDate}
+                    onChange={(e) => setNextFollowUpPrompt({ ...nextFollowUpPrompt, tempDate: e.target.value })}
+                    className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-xs font-mono text-white"
+                  />
+                </div>
+                <div className="flex items-center justify-end gap-2 pt-2">
+                  <button
+                    onClick={() => setNextFollowUpPrompt(null)}
+                    className="px-4 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs font-medium text-slate-200"
+                  >
+                    Done (Keep Cleared)
+                  </button>
+                  <button
+                    disabled={!nextFollowUpPrompt.tempDate}
+                    onClick={async () => {
+                      const target = applications.find((a) => a.id === nextFollowUpPrompt.appId);
+                      if (target && nextFollowUpPrompt.tempDate) {
+                        await persistApplicationRecord({
+                          ...target,
+                          followUpDate: nextFollowUpPrompt.tempDate,
+                          updatedAt: new Date().toISOString()
+                        });
+                      }
+                      setNextFollowUpPrompt(null);
+                    }}
+                    className="px-4 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-xs font-semibold text-white"
+                  >
+                    Schedule Next Follow-Up
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* ========================================== */}
+          {/* MODAL: CSV IMPORT WITH PREVIEW & CONFLICTS */}
+          {/* ========================================== */}
+          {isCsvModalOpen && (
+            <CsvImportModal
+              existingApplications={applications}
+              onClose={() => setIsCsvModalOpen(false)}
+              onCommitImport={async (recordsToSave) => {
+                for (const rec of recordsToSave) {
+                  await persistApplicationRecord(rec);
+                }
+                setIsCsvModalOpen(false);
+              }}
+            />
+          )}
+
+          {/* ========================================== */}
+          {/* MODAL: FIREBASE SETUP & SECURITY RULES     */}
+          {/* ========================================== */}
+          {showSetupModal && (
+            <FirebaseSetupModal
+              onClose={() => setShowSetupModal(false)}
+              onSaveConfig={(cfg) => {
+                localStorage.setItem(STORAGE_KEYS.FIREBASE_CONFIG, JSON.stringify(cfg));
+                localStorage.removeItem(STORAGE_KEYS.DEMO_MODE);
+                setShowSetupModal(false);
+                initFirebaseClient(cfg);
+              }}
+              onClearConfig={() => {
+                localStorage.removeItem(STORAGE_KEYS.FIREBASE_CONFIG);
+                setMode('unconfigured');
+                setShowSetupModal(false);
+              }}
+            />
+          )}
+        </div>
+      );
+    }
+
+    // ==========================================
+    // COMPONENT: ADD / EDIT APPLICATION MODAL
+    // ==========================================
+    function ApplicationFormModal({ existingApp, allApplications, onClose, onSwitchToExisting, onSave }) {
+      const [company, setCompany] = useState(existingApp?.company || '');
+      const [jobTitle, setJobTitle] = useState(existingApp?.jobTitle || '');
+      const [status, setStatus] = useState(existingApp?.status || 'Saved');
+      const [postingUrl, setPostingUrl] = useState(existingApp?.postingUrl || '');
+      const [salaryRange, setSalaryRange] = useState(existingApp?.salaryRange || '');
+      const [location, setLocation] = useState(existingApp?.location || '');
+      const [applicationDate, setApplicationDate] = useState(existingApp?.applicationDate || '');
+      const [deadline, setDeadline] = useState(existingApp?.deadline || '');
+      const [followUpDate, setFollowUpDate] = useState(existingApp?.followUpDate || '');
+      const [notes, setNotes] = useState(existingApp?.notes || '');
+      const [formError, setFormError] = useState(null);
+
+      // Duplicate warning state before final save
+      const [duplicateMatches, setDuplicateMatches] = useState(null);
+
+      // Sync form if user clicks "Open / Edit Existing Entry" from duplicate warning
+      useEffect(() => {
+        setCompany(existingApp?.company || '');
+        setJobTitle(existingApp?.jobTitle || '');
+        setStatus(existingApp?.status || 'Saved');
+        setPostingUrl(existingApp?.postingUrl || '');
+        setSalaryRange(existingApp?.salaryRange || '');
+        setLocation(existingApp?.location || '');
+        setApplicationDate(existingApp?.applicationDate || '');
+        setDeadline(existingApp?.deadline || '');
+        setFollowUpDate(existingApp?.followUpDate || '');
+        setNotes(existingApp?.notes || '');
+        setDuplicateMatches(null);
+        setFormError(null);
+      }, [existingApp]);
+
+      function buildRecordPayload() {
+        const now = new Date().toISOString();
+        const baseHistory = Array.isArray(existingApp?.activityHistory)
+          ? [...existingApp.activityHistory]
+          : [
+              {
+                id: generateId('evt'),
+                timestamp: now,
+                type: 'created',
+                detail: `Created application with status ${status}`
+              }
+            ];
+
+        if (existingApp && existingApp.status !== status) {
+          baseHistory.push({
+            id: generateId('evt'),
+            timestamp: now,
+            type: 'status_change',
+            detail: `Status changed from ${existingApp.status} to ${status}`
+          });
+        }
+
+        return {
+          id: existingApp?.id || generateId('app'),
+          company: company.trim(),
+          jobTitle: jobTitle.trim(),
+          status,
+          postingUrl: postingUrl.trim(),
+          salaryRange: salaryRange.trim(),
+          location: location.trim(),
+          // Strict Rule: Never automatically assign applicationDate
+          applicationDate: applicationDate.trim(),
+          deadline: deadline.trim(),
+          followUpDate: followUpDate.trim(),
+          notes: notes.trim(),
+          activityHistory: baseHistory,
+          createdAt: existingApp?.createdAt || now,
+          updatedAt: now
+        };
+      }
+
+      async function handleFormSubmit(e,confirmedDuplicateBypass = false) {
+        if (e) e.preventDefault();
+        setFormError(null);
+
+        if (!company.trim() || !jobTitle.trim() || !ALLOWED_STATUSES.includes(status)) {
+          setFormError('Company, Job Title, and a valid Status are required.');
+          return;
+        }
+
+        const candidate = buildRecordPayload();
+
+        if (!confirmedDuplicateBypass) {
+          const matches = [];
+          for (const other of allApplications) {
+            if (existingApp && other.id === existingApp.id) continue;
+            const res = checkDuplicateMatch(candidate, other);
+            if (res.isDuplicate) {
+              matches.push({ record: other, reasons: res.reasons });
+            }
+          }
+          if (matches.length > 0) {
+            setDuplicateMatches(matches);
+            return;
+          }
+        }
+
+        const transitionedSavedToAppliedBlankDate =
+          existingApp &&
+          existingApp.status === 'Saved' &&
+          status === 'Applied' &&
+          !candidate.applicationDate;
+
+        await onSave(candidate, transitionedSavedToAppliedBlankDate);
+      }
+
+      return (
+        <div className="fixed inset-0 z-40 bg-black/75 backdrop-blur-sm flex items-center justify-center p-4 overflow-y-auto">
+          <div className="bg-slate-900 border border-slate-800 rounded-2xl max-w-3xl w-full max-h-[92vh] flex flex-col overflow-hidden shadow-2xl">
+            <div className="px-6 py-4 bg-slate-950 border-b border-slate-800 flex items-center justify-between">
+              <h2 className="text-base font-bold text-white">
+                {existingApp ? `Edit Application — ${existingApp.company}` : 'Add Job Application'}
+              </h2>
+              <button onClick={onClose} className="text-slate-400 hover:text-white text-sm">✕</button>
+            </div>
+
+            <form onSubmit={(e) => handleFormSubmit(e, false)} className="p-6 overflow-y-auto space-y-5 text-xs">
+              {formError && (
+                <div className="p-3 rounded-lg bg-rose-950/80 border border-rose-600 text-rose-200">
+                  {formError}
+                </div>
+              )}
+
+              {/* Duplicate Warning Banner Inside Modal */}
+              {duplicateMatches && (
+                <div className="p-4 rounded-xl bg-amber-950/80 border-2 border-amber-500 text-amber-100 space-y-3">
+                  <div className="font-bold text-sm text-amber-300">
+                    ⚠️ Possible Duplicate Application Detected ({duplicateMatches.length})
+                  </div>
+                  <p className="text-xs text-amber-200">
+                    We found existing saved application(s) matching this URL or Company + Job Title. Choose how to proceed:
+                  </p>
+                  <div className="space-y-2 max-h-40 overflow-y-auto">
+                    {duplicateMatches.map(({ record, reasons }) => (
+                      <div key={record.id} className="p-3 rounded-lg bg-slate-950 border border-amber-700/50 flex items-center justify-between gap-2">
+                        <div>
+                          <div className="font-bold text-white">
+                            {record.company} — {record.jobTitle} <span className="text-amber-300 font-mono">[{record.status}]</span>
+                          </div>
+                          <div className="text-[11px] text-amber-300/90 mt-0.5">
+                            Match reason: {reasons.join(', ')}
+                          </div>
+                          {record.postingUrl && (
+                            <div className="text-[10px] font-mono text-slate-400 truncate max-w-md">
+                              URL: {record.postingUrl}
+                            </div>
+                          )}
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => onSwitchToExisting(record)}
+                          className="px-3 py-1.5 rounded bg-indigo-600 hover:bg-indigo-500 text-white font-semibold whitespace-nowrap"
+                        >
+                          Open / Edit Existing
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                  <div className="flex items-center justify-end gap-2 pt-2">
+                    <button
+                      type="button"
+                      onClick={onClose}
+                      className="px-3 py-1.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-200"
+                    >
+                      Skip / Cancel New Entry
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => handleFormSubmit(null, true)}
+                      className="px-3.5 py-1.5 rounded bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold"
+                    >
+                      Save Anyway (Confirm)
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {/* Required Fields */}
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+                <div>
+                  <label className="block text-slate-300 font-semibold mb-1">
+                    Company <span className="text-rose-400">*</span>
+                  </label>
+                  <input
+                    type="text"
+                    required
+                    value={company}
+                    onChange={(e) => setCompany(e.target.value)}
+                    placeholder="e.g. Red Hat, Cloudflare"
+                    className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white focus:border-indigo-500 focus:outline-none"
+                  />
+                </div>
+                <div>
+                  <label className="block text-slate-300 font-semibold mb-1">
+                    Job Title <span className="text-rose-400">*</span>
+                  </label>
+                  <input
+                    type="text"
+                    required
+                    value={jobTitle}
+                    onChange={(e) => setJobTitle(e.target.value)}
+                    placeholder="e.g. Linux Systems Administrator"
+                    className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white focus:border-indigo-500 focus:outline-none"
+                  />
+                </div>
+                <div>
+                  <label className="block text-slate-300 font-semibold mb-1">
+                    Status <span className="text-rose-400">*</span>
+                  </label>
+                  <select
+                    value={status}
+                    onChange={(e) => setStatus(e.target.value)}
+                    className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white focus:border-indigo-500 focus:outline-none"
+                  >
+                    {ALLOWED_STATUSES.map((st) => (
+                      <option key={st} value={st}>{st}</option>
+                    ))}
+                  </select>
+                </div>
+              </div>
+
+              {/* Optional Job Details */}
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+                <div className="sm:col-span-1">
+                  <label className="block text-slate-400 mb-1">Posting URL (Optional)</label>
+                  <input
+                    type="url"
+                    value={postingUrl}
+                    onChange={(e) => setPostingUrl(e.target.value)}
+                    placeholder="https://..."
+                    className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white font-mono focus:border-indigo-500 focus:outline-none"
+                  />
+                </div>
+                <div>
+                  <label className="block text-slate-400 mb-1">Salary Range (Optional)</label>
+                  <input
+                    type="text"
+                    value={salaryRange}
+                    onChange={(e) => setSalaryRange(e.target.value)}
+                    placeholder="e.g. $115k - $135k"
+                    className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white font-mono focus:border-indigo-500 focus:outline-none"
+                  />
+                </div>
+                <div>
+                  <label className="block text-slate-400 mb-1">Location (Optional)</label>
+                  <input
+                    type="text"
+                    value={location}
+                    onChange={(e) => setLocation(e.target.value)}
+                    placeholder="e.g. Remote / Orlando, FL"
+                    className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white focus:border-indigo-500 focus:outline-none"
+                  />
+                </div>
+              </div>
+
+              {/* Optional Dates (Never Invented) */}
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 pt-2 border-t border-slate-800">
+                <div>
+                  <div className="flex items-center justify-between mb-1">
+                    <label className="text-slate-400">Application Date</label>
+                    {applicationDate && (
+                      <button type="button" onClick={() => setApplicationDate('')} className="text-[10px] text-slate-500 hover:text-slate-300">Clear</button>
+                    )}
+                  </div>
+                  <input
+                    type="date"
+                    value={applicationDate}
+                    onChange={(e) => setApplicationDate(e.target.value)}
+                    className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white font-mono"
+                  />
+                </div>
+                <div>
+                  <div className="flex items-center justify-between mb-1">
+                    <label className="text-slate-400">Deadline (Alert if Saved)</label>
+                    {deadline && (
+                      <button type="button" onClick={() => setDeadline('')} className="text-[10px] text-slate-500 hover:text-slate-300">Clear</button>
+                    )}
+                  </div>
+                  <input
+                    type="date"
+                    value={deadline}
+                    onChange={(e) => setDeadline(e.target.value)}
+                    className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white font-mono"
+                  />
+                </div>
+                <div>
+                  <div className="flex items-center justify-between mb-1">
+                    <label className="text-slate-400">Follow-up Date</label>
+                    {followUpDate && (
+                      <button type="button" onClick={() => setFollowUpDate('')} className="text-[10px] text-slate-500 hover:text-slate-300">Clear</button>
+                    )}
+                  </div>
+                  <input
+                    type="date"
+                    value={followUpDate}
+                    onChange={(e) => setFollowUpDate(e.target.value)}
+                    className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white font-mono"
+                  />
+                </div>
+              </div>
+
+              {/* Notes */}
+              <div>
+                <label className="block text-slate-400 mb-1">Notes (Optional)</label>
+                <textarea
+                  rows="3"
+                  value={notes}
+                  onChange={(e) => setNotes(e.target.value)}
+                  placeholder="Key requirements (RHEL, Ansible, Terraform, AWS/GCP), recruiter contact, or interview notes..."
+                  className="w-full bg-slate-950 border border-slate-800 rounded-lg p-3 text-white focus:border-indigo-500 focus:outline-none"
+                />
+              </div>
+
+              {/* Activity History Timeline */}
+              {existingApp && Array.isArray(existingApp.activityHistory) && (
+                <div className="pt-3 border-t border-slate-800 space-y-2">
+                  <h3 className="text-xs font-bold uppercase tracking-wider text-slate-400">
+                    Activity History ({existingApp.activityHistory.length})
+                  </h3>
+                  <div className="bg-slate-950 border border-slate-800 rounded-lg p-3 max-h-40 overflow-y-auto space-y-2">
+                    {existingApp.activityHistory.map((evt) => (
+                      <div key={evt.id} className="flex items-start justify-between gap-2 text-[11px] border-b border-slate-900 pb-1.5 last:border-none last:pb-0">
+                        <span className="text-slate-200">{evt.detail}</span>
+                        <span className="text-slate-500 font-mono whitespace-nowrap">
+                          {formatLocalTimestamp(evt.timestamp)}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              <div className="flex items-center justify-end gap-2 pt-3 border-t border-slate-800">
+                <button
+                  type="button"
+                  onClick={onClose}
+                  className="px-4 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 font-medium"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  className="px-5 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white font-semibold shadow"
+                >
+                  {existingApp ? 'Save Changes' : 'Save Application'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      );
+    }
+
+    // ==========================================
+    // COMPONENT: CSV IMPORT & CONFLICT MODAL
+    // ==========================================
+    function CsvImportModal({ existingApplications, onClose, onCommitImport }) {
+      const [parseError, setParseError] = useState(null);
+      const [reviewRows, setReviewRows] = useState([]);
+
+      function handleFileUpload(e) {
+        const file = e.target.files?.[0];
+        if (!file) return;
+        const reader = new FileReader();
+        reader.onload = (evt) => processCsvContent(String(evt.target?.result || ''));
+        reader.readAsText(file);
+      }
+
+      function processCsvContent(rawText) {
+        setParseError(null);
+        setReviewRows([]);
+        if (!rawText.trim()) {
+          setParseError('The CSV file is empty.');
+          return;
+        }
+
+        const rows = parseRfc4180Csv(rawText.trim());
+        if (rows.length < 2) {
+          setParseError('CSV must include a header row and at least one application row.');
+          return;
+        }
+
+        const header = rows[0].map((h) => h.trim());
+        const idxMap = {};
+        header.forEach((h, idx) => { idxMap[h] = idx; });
+
+        if (idxMap.company === undefined || idxMap.jobTitle === undefined) {
+          setParseError('CSV header must include at least "company" and "jobTitle" columns.');
+          return;
+        }
+
+        const parsedItems = [];
+        const seenInCsv = [];
+
+        for (let i = 1; i < rows.length; i++) {
+          const r = rows[i];
+          if (r.length === 1 && !r[0].trim()) continue;
+
+          const getCol = (name) => (idxMap[name] !== undefined && r[idxMap[name]] !== undefined ? r[idxMap[name]].trim() : '');
+
+          const company = getCol('company');
+          const jobTitle = getCol('jobTitle');
+          if (!company || !jobTitle) continue;
+
+          const rawStatus = getCol('status');
+          const status = ALLOWED_STATUSES.includes(rawStatus) ? rawStatus : 'Saved';
+          const rowId = getCol('id') || generateId('app');
+
+          let parsedHistory = [];
+          const rawHistory = getCol('activityHistory');
+          if (rawHistory) {
+            try {
+              const arr = JSON.parse(rawHistory);
+              if (Array.isArray(arr)) parsedHistory = arr;
+            } catch (err) {
+              // Keep safe fallback if malformed JSON
+            }
+          }
+          if (parsedHistory.length === 0) {
+            parsedHistory = [{
+              id: generateId('evt'),
+              timestamp: new Date().toISOString(),
+              type: 'created',
+              detail: `Imported from CSV with status ${status}`
+            }];
+          }
+
+          const candidate = {
+            id: rowId,
+            company,
+            jobTitle,
+            status,
+            postingUrl: getCol('postingUrl'),
+            salaryRange: getCol('salaryRange'),
+            location: getCol('location'),
+            applicationDate: getCol('applicationDate'),
+            deadline: getCol('deadline'),
+            followUpDate: getCol('followUpDate'),
+            notes: getCol('notes'),
+            activityHistory: parsedHistory,
+            createdAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString()
+          };
+
+          // 1. Check Exact ID Conflict against existing DB
+          const existingById = existingApplications.find((a) => a.id === candidate.id);
+
+          // 2. Check URL / Company+Title Duplicate against DB
+          let dbDuplicate = null;
+          let dbReasons = [];
+          for (const ex of existingApplications) {
+            if (existingById && ex.id === existingById.id) continue;
+            const check = checkDuplicateMatch(candidate, ex);
+            if (check.isDuplicate) {
+              dbDuplicate = ex;
+              dbReasons = check.reasons;
+              break;
+            }
+          }
+
+          // 3. Check URL / Company+Title Duplicate against earlier rows in same CSV
+          let csvDuplicate = null;
+          let csvReasons = [];
+          for (const prev of seenInCsv) {
+            const check = checkDuplicateMatch(candidate, prev);
+            if (check.isDuplicate) {
+              csvDuplicate = prev;
+              csvReasons = check.reasons;
+              break;
+            }
+          }
+
+          seenInCsv.push(candidate);
+
+          let conflictType = 'clean';
+          let resolution = 'import'; // 'import' | 'skip' | 'replace_dedup' | 'import_new_id'
+          let matchSummary = '';
+
+          if (existingById) {
+            conflictType = 'id_conflict';
+            resolution = 'skip'; // Never silently overwrite
+            matchSummary = `Existing ID (${existingById.id}) for ${existingById.company} — ${existingById.jobTitle}`;
+          } else if (dbDuplicate) {
+            conflictType = 'duplicate';
+            resolution = 'skip';
+            matchSummary = `Matches saved entry "${dbDuplicate.company} — ${dbDuplicate.jobTitle}" (${dbReasons.join(', ')})`;
+          } else if (csvDuplicate) {
+            conflictType = 'duplicate';
+            resolution = 'skip';
+            matchSummary = `Matches earlier CSV row "${csvDuplicate.company} — ${csvDuplicate.jobTitle}" (${csvReasons.join(', ')})`;
+          }
+
+          parsedItems.push({
+            rowIndex: i,
+            candidate,
+            existingById,
+            conflictType,
+            resolution,
+            matchSummary
+          });
+        }
+
+        setReviewRows(parsedItems);
+      }
+
+      function updateRowResolution(idx, newResolution) {
+        setReviewRows((prev) =>
+          prev.map((item, i) => (i === idx ? { ...item, resolution: newResolution } : item))
+        );
+      }
+
+      function handleConfirmBatch() {
+        const finalRecords = [];
+        for (const item of reviewRows) {
+          if (item.resolution === 'skip') continue;
+          if (item.conflictType === 'id_conflict' && item.existingById) {
+            if (item.resolution === 'replace_dedup') {
+              const mergedHistory = mergeActivityHistories(
+                item.existingById.activityHistory,
+                item.candidate.activityHistory
+              );
+              finalRecords.push({
+                ...item.candidate,
+                id: item.existingById.id,
+                createdAt: item.existingById.createdAt || item.candidate.createdAt,
+                activityHistory: mergedHistory
+              });
+            } else if (item.resolution === 'import_new_id') {
+              finalRecords.push({
+                ...item.candidate,
+                id: generateId('app')
+              });
+            }
+          } else {
+            finalRecords.push(item.candidate);
+          }
+        }
+        onCommitImport(finalRecords);
+      }
+
+      return (
+        <div className="fixed inset-0 z-50 bg-black/75 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="bg-slate-900 border border-slate-800 rounded-2xl max-w-4xl w-full max-h-[90vh] flex flex-col overflow-hidden shadow-2xl text-xs">
+            <div className="px-6 py-4 bg-slate-950 border-b border-slate-800 flex items-center justify-between">
+              <h2 className="text-base font-bold text-white">CSV Import & Duplicate Review</h2>
+              <button onClick={onClose} className="text-slate-400 hover:text-white">✕</button>
+            </div>
+
+            <div className="p-6 overflow-y-auto space-y-5">
+              <div className="p-4 rounded-xl bg-slate-950 border border-slate-800 space-y-2">
+                <label className="block font-semibold text-slate-200">Select CSV Backup File</label>
+                <input
+                  type="file"
+                  accept=".csv,text/csv"
+                  onChange={handleFileUpload}
+                  className="block w-full text-xs text-slate-300 file:mr-3 file:py-1.5 file:px-3 file:rounded-lg file:border-0 file:text-xs file:font-semibold file:bg-indigo-600 file:text-white hover:file:bg-indigo-500"
+                />
+                <p className="text-[11px] text-slate-400">
+                  Supports RFC 4180 CSV files with JSON-encoded <code className="text-indigo-300">activityHistory</code> arrays. Checks against both your saved applications and other rows in the CSV file.
+                </p>
+              </div>
+
+              {parseError && (
+                <div className="p-3 rounded-lg bg-rose-950 border border-rose-600 text-rose-200">
+                  {parseError}
+                </div>
+              )}
+
+              {reviewRows.length > 0 && (
+                <div className="space-y-3">
+                  <div className="flex items-center justify-between">
+                    <span className="font-bold text-white">
+                      Previewing {reviewRows.length} CSV Rows
+                    </span>
+                    <span className="text-slate-400 font-mono">
+                      {reviewRows.filter((r) => r.resolution !== 'skip').length} selected to import
+                    </span>
+                  </div>
+
+                  <div className="border border-slate-800 rounded-xl overflow-hidden max-h-80 overflow-y-auto">
+                    <table className="w-full text-left text-xs">
+                      <thead className="bg-slate-950 text-slate-400 uppercase text-[10px]">
+                        <tr>
+                          <th className="py-2.5 px-3">Row</th>
+                          <th className="py-2.5 px-3">Company & Role</th>
+                          <th className="py-2.5 px-3">Status</th>
+                          <th className="py-2.5 px-3">Check Result</th>
+                          <th className="py-2.5 px-3">Action</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-800">
+                        {reviewRows.map((item, idx) => (
+                          <tr key={idx} className={item.conflictType !== 'clean' ? 'bg-amber-950/20' : 'bg-slate-900'}>
+                            <td className="py-2.5 px-3 font-mono text-slate-400">#{item.rowIndex}</td>
+                            <td className="py-2.5 px-3">
+                              <div className="font-semibold text-white">{item.candidate.company}</div>
+                              <div className="text-slate-400 font-mono">{item.candidate.jobTitle}</div>
+                            </td>
+                            <td className="py-2.5 px-3">
+                              <span className={`px-2 py-0.5 rounded-full border text-[10px] ${getStatusBadgeClasses(item.candidate.status)}`}>
+                                {item.candidate.status}
+                              </span>
+                            </td>
+                            <td className="py-2.5 px-3">
+                              {item.conflictType === 'clean' ? (
+                                <span className="text-emerald-400 font-medium">✓ Clean new entry</span>
+                              ) : (
+                                <span className="text-amber-300">{item.matchSummary}</span>
+                              )}
+                            </td>
+                            <td className="py-2.5 px-3">
+                              {item.conflictType === 'id_conflict' ? (
+                                <select
+                                  value={item.resolution}
+                                  onChange={(e) => updateRowResolution(idx, e.target.value)}
+                                  className="bg-slate-950 border border-amber-600/60 rounded px-2 py-1 text-amber-200"
+                                >
+                                  <option value="skip">Skip (Keep Existing)</option>
+                                  <option value="replace_dedup">Replace & Deduplicate History</option>
+                                  <option value="import_new_id">Import as New ID</option>
+                                </select>
+                              ) : (
+                                <select
+                                  value={item.resolution}
+                                  onChange={(e) => updateRowResolution(idx, e.target.value)}
+                                  className="bg-slate-950 border border-slate-700 rounded px-2 py-1 text-slate-200"
+                                >
+                                  <option value="import">Keep / Import Row</option>
+                                  <option value="skip">Skip Row</option>
+                                </select>
+                              )}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+
+                  <div className="flex items-center justify-end gap-2 pt-2">
+                    <button
+                      onClick={onClose}
+                      className="px-4 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300"
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      onClick={handleConfirmBatch}
+                      className="px-5 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-semibold shadow"
+                    >
+                      Complete Import ({reviewRows.filter((r) => r.resolution !== 'skip').length} rows)
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // ==========================================
+    // COMPONENT: FIREBASE SETUP & SECURITY RULES
+    // ==========================================
+    function FirebaseSetupModal({ onClose, onSaveConfig, onClearConfig }) {
+      const existingRaw = localStorage.getItem(STORAGE_KEYS.FIREBASE_CONFIG);
+      const [jsonInput, setJsonInput] = useState(existingRaw || '');
+      const [error, setError] = useState(null);
+      const [copied, setCopied] = useState(false);
+
+      const securityRulesText = `rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /users/{userId}/{document=**} {
+      allow read, write: if request.auth != null && request.auth.uid == userId;
+    }
+  }
+}`;
+
+      function handleSave() {
+        setError(null);
+        try {
+          const cleaned = jsonInput
+            .trim()
+            .replace(/^(const|let|var)\s+\w+\s*=\s*/, '')
+            .replace(/;$/, '');
+          const parsed = JSON.parse(cleaned);
+          if (!parsed.apiKey || !parsed.authDomain || !parsed.projectId || !parsed.appId) {
+            setError('Config JSON must include apiKey, authDomain, projectId, and appId.');
+            return;
+          }
+          onSaveConfig(parsed);
+        } catch (e) {
+          setError('Invalid JSON format. Ensure keys and values are wrapped in double quotes.');
+        }
+      }
+
+      return (
+        <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="bg-slate-900 border border-slate-800 rounded-2xl max-w-3xl w-full max-h-[92vh] flex flex-col overflow-hidden shadow-2xl text-xs">
+            <div className="px-6 py-4 bg-slate-950 border-b border-slate-800 flex items-center justify-between">
+              <h2 className="text-base font-bold text-white">Firebase Cloud Sync & Security Rules Setup</h2>
+              <button onClick={onClose} className="text-slate-400 hover:text-white">✕</button>
+            </div>
+
+            <div className="p-6 overflow-y-auto space-y-5 text-slate-300">
+              <div className="p-4 rounded-xl bg-amber-950/60 border border-amber-600/60 text-amber-200 space-y-1">
+                <div className="font-bold text-amber-300">Important Security Notice</div>
+                <p className="leading-relaxed">
+                  Pasting your Firebase Web Config JSON below <strong>only connects the browser SDK</strong>. It does <strong>not</strong> automatically enable Google Sign-In or deploy database access rules. You must complete Steps 2 and 3 in the Firebase Console to enforce per-user privacy.
+                </p>
+              </div>
+
+              <div className="space-y-3">
+                <div className="p-3.5 rounded-lg bg-slate-950 border border-slate-800">
+                  <div className="font-bold text-white">Step 1: Create a Firebase Web App</div>
+                  <p className="text-slate-400 mt-1">
+                    In the Firebase Console, create a project, register a Web App, and copy the <code className="text-indigo-300">firebaseConfig</code> JSON object.
+                  </p>
+                </div>
+
+                <div className="p-3.5 rounded-lg bg-slate-950 border border-slate-800">
+                  <div className="font-bold text-white">Step 2: Enable Google Sign-In & Authorized Domains</div>
+                  <p className="text-slate-400 mt-1">
+                    Go to <strong>Authentication → Sign-in method</strong> and enable <strong>Google</strong>. Under <strong>Authentication → Settings → Authorized domains</strong>, ensure <code className="text-indigo-300">{window.location.hostname || 'localhost'}</code> is listed.
+                  </p>
+                </div>
+
+                <div className="p-3.5 rounded-lg bg-slate-950 border border-slate-800 space-y-2">
+                  <div className="flex items-center justify-between">
+                    <span className="font-bold text-white">Step 3: Deploy Firestore Security Rules (Required for User Isolation)</span>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        navigator.clipboard.writeText(securityRulesText);
+                        setCopied(true);
+                        setTimeout(() => setCopied(false), 2000);
+                      }}
+                      className="px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 text-indigo-300 border border-slate-700"
+                    >
+                      {copied ? '✓ Copied Rules' : 'Copy Security Rules'}
+                    </button>
+                  </div>
+                  <pre className="p-3 rounded bg-slate-900 border border-slate-800 text-emerald-400 font-mono overflow-x-auto">
+                    {securityRulesText}
+                  </pre>
+                </div>
+              </div>
+
+              <div>
+                <label className="block font-bold text-white mb-1.5">Paste Firebase Web Config JSON</label>
+                <textarea
+                  rows="6"
+                  value={jsonInput}
+                  onChange={(e) => setJsonInput(e.target.value)}
+                  placeholder={'{\n  "apiKey": "AIza...",\n  "authDomain": "your-project.firebaseapp.com",\n  "projectId": "your-project",\n  "storageBucket": "your-project.appspot.com",\n  "messagingSenderId": "123456789",\n  "appId": "1:123456789:web:abcdef"\n}'}
+                  className="w-full bg-slate-950 border border-slate-800 rounded-lg p-3 font-mono text-white focus:border-indigo-500 focus:outline-none"
+                />
+                {error && <p className="text-rose-400 mt-1.5 font-medium">{error}</p>}
+              </div>
+
+              <div className="flex items-center justify-between pt-2 border-t border-slate-800">
+                {existingRaw ? (
+                  <button
+                    type="button"
+                    onClick={onClearConfig}
+                    className="px-3 py-2 rounded-lg bg-rose-950/60 hover:bg-rose-900 text-rose-300 border border-rose-800/50"
+                  >
+                    Disconnect / Clear Config
+                  </button>
+                ) : <div />}
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={onClose}
+                    className="px-4 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleSave}
+                    className="px-5 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white font-semibold shadow"
+                  >
+                    Save & Connect Firebase
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>
